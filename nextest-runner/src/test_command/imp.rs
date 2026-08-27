@@ -3,6 +3,7 @@
 
 use crate::{
     errors::{ChildFdError, ErrorList},
+    test_command::spawn_process,
     test_output::{CaptureStrategy, ChildExecutionOutput, ChildOutput, ChildSplitOutput},
 };
 use bytes::BytesMut;
@@ -48,29 +49,25 @@ pub(super) fn spawn(
         cmd.stdin(Stdio::null());
     }
 
-    let combined_rx: Option<PipeReader> = match strategy {
-        CaptureStrategy::None => None,
-        CaptureStrategy::Split => {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            None
-        }
-        CaptureStrategy::Combined => {
-            // We use std::io::pipe() here rather than tokio::net::unix::pipe()
-            // for a couple of reasons:
-            //
-            // * std::io::pipe has the most up-to-date information about things
-            //   like atomic O_CLOEXEC. In particular, mio-pipe 0.1.1 doesn't do
-            //   O_CLOEXEC on platforms like illumos.
-            // * There's no analog to Tokio's anonymous pipes on Windows, while
-            //   std::io::pipe works on all platforms.
-            let (rx, tx) = std::io::pipe()?;
-            cmd.stdout(tx.try_clone()?).stderr(tx);
-            Some(rx)
-        }
-    };
+    let (mut child, combined_rx) = spawn_process(|| {
+        let combined_rx: Option<PipeReader> = match strategy {
+            CaptureStrategy::None => None,
+            CaptureStrategy::Split => {
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                None
+            }
+            CaptureStrategy::Combined => {
+                // std::io::pipe() tracks platform-specific O_CLOEXEC support more
+                // accurately than mio-pipe 0.1.1 and also works on Windows.
+                let (rx, tx) = std::io::pipe()?;
+                cmd.stdout(tx.try_clone()?).stderr(tx);
+                Some(rx)
+            }
+        };
 
-    let mut cmd: tokio::process::Command = cmd.into();
-    let mut child = cmd.spawn()?;
+        let mut cmd: tokio::process::Command = cmd.into();
+        Ok((cmd.spawn()?, combined_rx))
+    })?;
 
     let output = match strategy {
         CaptureStrategy::None => ChildFds::new_split(None, None),

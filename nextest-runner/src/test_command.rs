@@ -13,6 +13,8 @@ use crate::{
 use camino::{Utf8Path, Utf8PathBuf};
 use guppy::graph::PackageMetadata;
 use quick_junit::ReportUuid;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
@@ -25,6 +27,9 @@ use tracing::warn;
 
 mod imp;
 pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
+
+#[cfg(target_os = "macos")]
+static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalExecuteContext<'a> {
@@ -204,7 +209,7 @@ impl TestCommand {
         let mut cmd = self.command;
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let res = tokio::process::Command::from(cmd).spawn();
+        let res = spawn_process(|| tokio::process::Command::from(cmd).spawn());
 
         if let Some(ctx) = self.double_spawn {
             ctx.finish();
@@ -212,6 +217,17 @@ impl TestCommand {
 
         res?.wait_with_output().await
     }
+}
+
+pub(super) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(target_os = "macos")]
+    // macOS lacks pipe2(), so Rust must set FD_CLOEXEC after pipe creation.
+    // Serialize spawns to close rust-lang/rust#95584's inheritance window.
+    let _guard = PROCESS_SPAWN_LOCK
+        .lock()
+        .expect("process spawn lock is not poisoned");
+
+    spawn()
 }
 
 pub(crate) fn create_command<I, S>(
@@ -403,6 +419,84 @@ pub(crate) fn apply_ld_dyld_env(cmd: &mut std::process::Command, dylib_path: &Os
 mod tests {
     use super::*;
     use indoc::indoc;
+
+    #[cfg(target_os = "macos")]
+    const SPAWN_CONCURRENCY: usize = 32;
+
+    #[cfg(target_os = "macos")]
+    const SPAWN_ROUNDS: usize = 32;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_spawns_do_not_inherit_capture_pipes() {
+        let executable = std::env::current_exe().expect("current test executable is available");
+        let barrier = std::sync::Barrier::new(SPAWN_CONCURRENCY);
+        let outputs = std::thread::scope(|scope| {
+            (0..SPAWN_CONCURRENCY)
+                .map(|_| {
+                    let executable = &executable;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        (0..SPAWN_ROUNDS)
+                            .map(|_| {
+                                barrier.wait();
+                                spawn_fd_check(executable)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("spawn thread does not panic"))
+                .collect::<Vec<_>>()
+        });
+
+        let failure_counts = (
+            outputs.iter().filter(|output| output.is_err()).count(),
+            outputs
+                .iter()
+                .filter(|output| output.as_ref().is_ok_and(|output| !output.status.success()))
+                .count(),
+        );
+        let first_failure = outputs
+            .into_iter()
+            .find(|output| !output.as_ref().is_ok_and(|output| output.status.success()));
+        assert_eq!(
+            failure_counts,
+            (0, 0),
+            "child spawn errors and inherited pipes; first failure: {first_failure:#?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_fd_check(executable: &std::path::Path) -> std::io::Result<std::process::Output> {
+        let mut command = std::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "test_command::tests::child_has_only_standard_fds",
+                "--ignored",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        spawn_process(|| command.spawn()).and_then(std::process::Child::wait_with_output)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn child_has_only_standard_fds() {
+        let inherited_fds = (3..256)
+            .filter(|&fd| {
+                // SAFETY: F_GETFD accepts any integer and does not consume the descriptor.
+                (unsafe { libc::fcntl(fd, libc::F_GETFD) }) != -1
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            inherited_fds.is_empty(),
+            "inherited descriptors: {inherited_fds:?}"
+        );
+    }
 
     #[test]
     fn parse_build_script() {
