@@ -269,11 +269,17 @@ pub(crate) fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
 /// write lock.
 ///
 /// The standard library creates one more pipe of its own when it falls back
-/// from `posix_spawn` to fork and exec: for example, a bare program name with
-/// `PATH` overridden in the environment, or a relative program path combined
-/// with a working directory. That pipe is not covered here. If a concurrent
-/// child inherits its write end, the spawn blocks until that child exits, but
-/// the capture pipes stay unaffected.
+/// from `posix_spawn` to fork and exec, and that pipe is not covered here.
+/// Nextest does not reach that path in the default configuration:
+/// [`create_command`] spawns the current executable through the double-spawn
+/// stub, so the program the standard library sees is absolute, and the stub
+/// execs the wrapper without a further spawn. Interceptors skip double-spawn
+/// but create processes serially, so no other spawn can overlap. The fallback
+/// remains reachable when the current executable cannot be determined and a
+/// wrapper script uses a relative path without `relative-to`, or a bare name
+/// while `PATH` is set through `[env]` or a setup script. Even then the effect
+/// is a spawn that blocks until the inheriting child exits; the capture pipes
+/// stay unaffected.
 pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     let _guard = SPAWN_INHERITS_PIPES.then(|| {
         PROCESS_SPAWN_LOCK
