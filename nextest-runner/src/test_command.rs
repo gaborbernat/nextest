@@ -18,13 +18,14 @@ use std::{
     collections::{BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fs::File,
-    io::{BufRead, BufReader},
-    sync::{LazyLock, Mutex, PoisonError},
+    io::{BufRead, BufReader, PipeReader, PipeWriter},
+    sync::{LazyLock, PoisonError, RwLock},
 };
 use tracing::warn;
 
 mod imp;
 pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
+use imp::{pipe_reader_to_child_stderr, pipe_reader_to_child_stdout};
 
 /// Whether a concurrent spawn can inherit a freshly created capture pipe.
 ///
@@ -34,6 +35,11 @@ pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
 /// the pipe and keeps it open after the test exits, which nextest reports as a
 /// leak (rust-lang/rust#95584). Windows has the same race, but the standard
 /// library already serializes `CreateProcess` there.
+///
+/// On these targets, [`create_pipe`] and [`spawn_process`] exclude each other
+/// through [`PROCESS_SPAWN_LOCK`]: pipe creation takes the write lock and
+/// spawning takes the read lock, so spawns still run concurrently with each
+/// other.
 ///
 /// Keep the list in sync with `library/std/src/sys/pipe/unix.rs`.
 const SPAWN_INHERITS_PIPES: bool = cfg!(all(
@@ -52,7 +58,7 @@ const SPAWN_INHERITS_PIPES: bool = cfg!(all(
     ))
 ));
 
-static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+static PROCESS_SPAWN_LOCK: RwLock<()> = RwLock::new(());
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalExecuteContext<'a> {
@@ -229,10 +235,7 @@ impl TestCommand {
     }
 
     pub(crate) async fn wait_with_output(self) -> std::io::Result<std::process::Output> {
-        let mut cmd = self.command;
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let res = spawn_process(|| tokio::process::Command::from(cmd).spawn());
+        let res = spawn_piped(self.command, true, true);
 
         if let Some(ctx) = self.double_spawn {
             ctx.finish();
@@ -242,20 +245,70 @@ impl TestCommand {
     }
 }
 
-/// Runs `spawn`, serializing it against other spawns where
-/// [`SPAWN_INHERITS_PIPES`] is set.
+/// Creates a pipe that no concurrent [`spawn_process`] call can inherit.
 ///
-/// The closure must create the capture pipes as well as the process, so that
-/// the window between pipe creation and `FD_CLOEXEC` is covered.
-pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+/// This uses `std::io::pipe()` rather than `tokio::net::unix::pipe()` because
+/// the standard library has the most up-to-date knowledge of atomic
+/// `O_CLOEXEC` support (mio-pipe 0.1.1 does not set it on illumos, for
+/// example), and because Tokio has no anonymous pipes on Windows.
+pub(crate) fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
     // The lock guards no data, so a panic while holding it leaves nothing in
     // an inconsistent state and poisoning can be ignored.
     let _guard = SPAWN_INHERITS_PIPES.then(|| {
         PROCESS_SPAWN_LOCK
-            .lock()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    });
+    std::io::pipe()
+}
+
+/// Runs `spawn` while no [`create_pipe`] call is in progress.
+///
+/// Capture pipes must come from [`create_pipe`] rather than `Stdio::piped()`,
+/// which would create them inside the standard library's spawn without the
+/// write lock.
+///
+/// The standard library creates one more pipe of its own when it falls back
+/// from `posix_spawn` to fork and exec: for example, a bare program name with
+/// `PATH` overridden in the environment, or a relative program path combined
+/// with a working directory. That pipe is not covered here. If a concurrent
+/// child inherits its write end, the spawn blocks until that child exits, but
+/// the capture pipes stay unaffected.
+pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    let _guard = SPAWN_INHERITS_PIPES.then(|| {
+        PROCESS_SPAWN_LOCK
+            .read()
             .unwrap_or_else(PoisonError::into_inner)
     });
     spawn()
+}
+
+/// Spawns `cmd`, capturing the requested streams through pipes from
+/// [`create_pipe`] and attaching the reader ends to the returned child.
+pub(crate) fn spawn_piped(
+    mut cmd: std::process::Command,
+    capture_stdout: bool,
+    capture_stderr: bool,
+) -> std::io::Result<tokio::process::Child> {
+    let stdout_rx = if capture_stdout {
+        let (rx, tx) = create_pipe()?;
+        cmd.stdout(tx);
+        Some(rx)
+    } else {
+        None
+    };
+    let stderr_rx = if capture_stderr {
+        let (rx, tx) = create_pipe()?;
+        cmd.stderr(tx);
+        Some(rx)
+    } else {
+        None
+    };
+
+    let mut child = spawn_process(|| tokio::process::Command::from(cmd).spawn())?;
+    child.stdout = stdout_rx.map(pipe_reader_to_child_stdout).transpose()?;
+    child.stderr = stderr_rx.map(pipe_reader_to_child_stderr).transpose()?;
+    Ok(child)
 }
 
 pub(crate) fn create_command<I, S>(

@@ -3,15 +3,11 @@
 
 use crate::{
     errors::{ChildFdError, ErrorList},
-    test_command::spawn_process,
+    test_command::{create_pipe, spawn_piped, spawn_process},
     test_output::{CaptureStrategy, ChildExecutionOutput, ChildOutput, ChildSplitOutput},
 };
 use bytes::BytesMut;
-use std::{
-    io::{self, PipeReader},
-    process::Stdio,
-    sync::Arc,
-};
+use std::{io, process::Stdio, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, BufReader},
@@ -32,6 +28,8 @@ cfg_if::cfg_if! {
     }
 }
 
+pub(super) use os::{pipe_reader_to_child_stderr, pipe_reader_to_child_stdout};
+
 /// A spawned child process along with its file descriptors.
 pub(crate) struct Child {
     pub child: TokioChild,
@@ -49,43 +47,27 @@ pub(super) fn spawn(
         cmd.stdin(Stdio::null());
     }
 
-    let (mut child, combined_rx) = spawn_process(|| {
-        let combined_rx: Option<PipeReader> = match strategy {
-            CaptureStrategy::None => None,
-            CaptureStrategy::Split => {
-                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-                None
-            }
-            CaptureStrategy::Combined => {
-                // std::io::pipe() tracks platform-specific O_CLOEXEC support more
-                // accurately than mio-pipe 0.1.1 and also works on Windows.
-                let (rx, tx) = std::io::pipe()?;
-                cmd.stdout(tx.try_clone()?).stderr(tx);
-                Some(rx)
-            }
-        };
-
-        let mut cmd: tokio::process::Command = cmd.into();
-        Ok((cmd.spawn()?, combined_rx))
-    })?;
-
-    let output = match strategy {
-        CaptureStrategy::None => ChildFds::new_split(None, None),
+    let (child, child_fds) = match strategy {
+        CaptureStrategy::None => {
+            let child = spawn_process(|| tokio::process::Command::from(cmd).spawn())?;
+            (child, ChildFds::new_split(None, None))
+        }
         CaptureStrategy::Split => {
+            let mut child = spawn_piped(cmd, true, true)?;
             let stdout = child.stdout.take().expect("stdout was set");
             let stderr = child.stderr.take().expect("stderr was set");
-
-            ChildFds::new_split(Some(stdout), Some(stderr))
+            (child, ChildFds::new_split(Some(stdout), Some(stderr)))
         }
-        CaptureStrategy::Combined => ChildFds::new_combined(
-            os::pipe_reader_to_file(combined_rx.expect("combined_fx was set")).into(),
-        ),
+        CaptureStrategy::Combined => {
+            let (rx, tx) = create_pipe()?;
+            cmd.stdout(tx.try_clone()?).stderr(tx);
+            let child = spawn_process(|| tokio::process::Command::from(cmd).spawn())?;
+            let combined = os::pipe_reader_to_file(rx).into();
+            (child, ChildFds::new_combined(combined))
+        }
     };
 
-    Ok(Child {
-        child,
-        child_fds: output,
-    })
+    Ok(Child { child, child_fds })
 }
 
 /// The size of each buffered reader's buffer, and the size at which we grow the combined buffer.
