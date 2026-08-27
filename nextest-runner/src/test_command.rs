@@ -13,22 +13,45 @@ use crate::{
 use camino::{Utf8Path, Utf8PathBuf};
 use guppy::graph::PackageMetadata;
 use quick_junit::ReportUuid;
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fs::File,
     io::{BufRead, BufReader},
-    sync::LazyLock,
+    sync::{LazyLock, Mutex, PoisonError},
 };
 use tracing::warn;
 
 mod imp;
 pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
 
-#[cfg(target_os = "macos")]
+/// Whether a concurrent spawn can inherit a freshly created capture pipe.
+///
+/// The standard library creates pipes with `pipe2(O_CLOEXEC)` on the targets
+/// listed below. On every other Unix it calls `pipe()` and then sets
+/// `FD_CLOEXEC`, so a child spawned from another thread in that window inherits
+/// the pipe and keeps it open after the test exits, which nextest reports as a
+/// leak (rust-lang/rust#95584). Windows has the same race, but the standard
+/// library already serializes `CreateProcess` there.
+///
+/// Keep the list in sync with `library/std/src/sys/pipe/unix.rs`.
+const SPAWN_INHERITS_PIPES: bool = cfg!(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "cygwin",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "hurd",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+));
+
 static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug)]
@@ -219,14 +242,19 @@ impl TestCommand {
     }
 }
 
-pub(super) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    #[cfg(target_os = "macos")]
-    // macOS lacks pipe2(), so Rust must set FD_CLOEXEC after pipe creation.
-    // Serialize spawns to close rust-lang/rust#95584's inheritance window.
-    let _guard = PROCESS_SPAWN_LOCK
-        .lock()
-        .expect("process spawn lock is not poisoned");
-
+/// Runs `spawn`, serializing it against other spawns where
+/// [`SPAWN_INHERITS_PIPES`] is set.
+///
+/// The closure must create the capture pipes as well as the process, so that
+/// the window between pipe creation and `FD_CLOEXEC` is covered.
+pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    // The lock guards no data, so a panic while holding it leaves nothing in
+    // an inconsistent state and poisoning can be ignored.
+    let _guard = SPAWN_INHERITS_PIPES.then(|| {
+        PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    });
     spawn()
 }
 

@@ -19,7 +19,7 @@ use crate::{
     list::TestList,
     platform::BuildPlatforms,
     reporter::events::SetupScriptEnvMap,
-    test_command::{apply_ld_dyld_env, create_command},
+    test_command::{apply_ld_dyld_env, create_command, spawn_process},
 };
 use camino::Utf8Path;
 use camino_tempfile::Utf8TempPath;
@@ -352,7 +352,7 @@ impl SetupScriptCommand {
 
     pub(crate) fn spawn(self) -> std::io::Result<(tokio::process::Child, Utf8TempPath)> {
         let mut command = tokio::process::Command::from(self.command);
-        let res = command.spawn();
+        let res = spawn_process(|| command.spawn());
         if let Some(ctx) = self.double_spawn {
             ctx.finish();
         }
