@@ -348,3 +348,266 @@ impl ChildOutputMut {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::{
+        collections::BTreeSet,
+        ffi::c_void,
+        io,
+        mem::{self, MaybeUninit},
+        os::fd::{AsRawFd, RawFd},
+        path::Path,
+        process::Command,
+        sync::Barrier,
+        thread,
+    };
+
+    const PIPE_IDENTITIES_PREFIX: &str = "NEXTEST_PIPE_IDENTITIES=";
+    const SPAWN_CONCURRENCY: usize = 32;
+    const SPAWN_ROUNDS: usize = 32;
+    const PROC_PIDFDPIPEINFO: libc::c_int = 6;
+
+    #[test]
+    fn concurrent_spawns_do_not_inherit_capture_pipes() {
+        let executable = std::env::current_exe().expect("current test executable is available");
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime starts");
+        let mut inheritances = Vec::new();
+        let mut omissions = Vec::new();
+
+        for _ in 0..SPAWN_ROUNDS {
+            let barrier = Barrier::new(SPAWN_CONCURRENCY);
+            let children = thread::scope(|scope| {
+                (0..SPAWN_CONCURRENCY)
+                    .map(|_| {
+                        let runtime_handle = runtime.handle().clone();
+                        let executable = &executable;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let _guard = runtime_handle.enter();
+                            spawn_pipe_reporter(executable)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().expect("spawn thread does not panic"))
+                    .collect::<io::Result<Vec<_>>>()
+                    .expect("capture children start")
+            });
+            let reports = children
+                .into_iter()
+                .map(|mut child| {
+                    let capture_identity = capture_identity(&child);
+                    let child_identities = runtime.block_on(read_pipe_identities(&mut child));
+                    wait_until_stopped(&child);
+                    (capture_identity, child_identities, child)
+                })
+                .collect::<Vec<_>>();
+            let capture_identities = reports
+                .iter()
+                .map(|(identity, _, _)| *identity)
+                .collect::<BTreeSet<_>>();
+
+            omissions.extend(
+                reports
+                    .iter()
+                    .filter(|(capture, child, _)| !child.contains(capture))
+                    .map(|(capture, child, _)| (*capture, child.clone())),
+            );
+            inheritances.extend(reports.iter().flat_map(|(capture, child, _)| {
+                let capture = *capture;
+                child
+                    .intersection(&capture_identities)
+                    .copied()
+                    .filter(move |identity| *identity != capture)
+                    .map(move |inherited| (capture, inherited))
+            }));
+            for (_, _, child) in &reports {
+                resume(child);
+            }
+            for (_, _, child) in reports {
+                runtime.block_on(collect_output(child));
+            }
+            assert_eq!(capture_identities.len(), SPAWN_CONCURRENCY);
+        }
+
+        assert_eq!(
+            (omissions.len(), inheritances.len()),
+            (0, 0),
+            "capture reports omitted own pipes or inherited sibling pipes: {:#?}, {:#?}",
+            omissions.first(),
+            inheritances.first()
+        );
+    }
+
+    fn spawn_pipe_reporter(executable: &Path) -> io::Result<Child> {
+        let mut command = Command::new(executable);
+        command.args([
+            "--exact",
+            "test_command::imp::tests::child_reports_pipe_identities",
+            "--ignored",
+            "--nocapture",
+        ]);
+        spawn(command, CaptureStrategy::Combined, false)
+    }
+
+    fn capture_identity(child: &Child) -> PipeHandle {
+        match &child.child_fds {
+            ChildFds::Combined { combined } => {
+                PipeHandle(pipe_info(combined.reader.get_ref().as_raw_fd()).pipe_peerhandle)
+            }
+            ChildFds::Split { .. } => unreachable!("reporter output is combined"),
+        }
+    }
+
+    async fn read_pipe_identities(child: &mut Child) -> BTreeSet<PipeHandle> {
+        let ChildFds::Combined { combined } = &mut child.child_fds else {
+            unreachable!("reporter output is combined");
+        };
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                combined
+                    .reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("capture output is readable"),
+                0,
+                "child exited before reporting pipe identities"
+            );
+            if let Some(identities) = line.strip_prefix(PIPE_IDENTITIES_PREFIX) {
+                return parse_pipe_identities(identities.trim_end());
+            }
+        }
+    }
+
+    fn wait_until_stopped(child: &Child) {
+        let pid = child.child.id().expect("capture child has a process ID") as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: waitpid writes one status value and leaves the stopped child alive.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(libc::WIFSTOPPED(status), "capture child stopped");
+    }
+
+    fn resume(child: &Child) {
+        let pid = child.child.id().expect("capture child has a process ID") as libc::pid_t;
+        // SAFETY: kill sends SIGCONT without accessing process memory.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    }
+
+    async fn collect_output(mut child: Child) {
+        let status = child.child.wait().await.expect("capture child exits");
+        let mut accumulator = ChildAccumulator::new(child.child_fds);
+        while !accumulator.fds.is_done() {
+            accumulator.fill_buf().await;
+        }
+        assert!(status.success(), "capture child succeeds");
+        assert!(
+            accumulator.errors.is_empty(),
+            "capture reads succeed: {:?}",
+            accumulator.errors
+        );
+    }
+
+    fn parse_pipe_identities(identities: &str) -> BTreeSet<PipeHandle> {
+        identities
+            .split(',')
+            .map(|handle| PipeHandle(handle.parse().expect("pipe handle is numeric")))
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn child_reports_pipe_identities() {
+        let identities = open_pipe_identities()
+            .into_iter()
+            .map(|handle| handle.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("{PIPE_IDENTITIES_PREFIX}{identities}");
+        // SAFETY: SIGSTOP suspends this child until the parent records every pipe identity.
+        assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+    }
+
+    fn open_pipe_identities() -> BTreeSet<PipeHandle> {
+        let pid = std::process::id() as libc::c_int;
+        // SAFETY: A null buffer asks proc_pidinfo for the required byte count.
+        let required =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        assert!(required >= 0, "proc_pidinfo sizes the descriptor list");
+
+        let entry_size = mem::size_of::<libc::proc_fdinfo>();
+        let mut entries = Vec::<libc::proc_fdinfo>::with_capacity(
+            required as usize / entry_size + SPAWN_CONCURRENCY,
+        );
+        // SAFETY: proc_pidinfo initializes at most the vector's allocated capacity.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast::<c_void>(),
+                (entries.capacity() * entry_size) as libc::c_int,
+            )
+        };
+        assert!(filled >= 0, "proc_pidinfo lists descriptors");
+        // SAFETY: proc_pidinfo returned the number of initialized bytes.
+        unsafe { entries.set_len(filled as usize / entry_size) };
+
+        entries
+            .into_iter()
+            .filter(|entry| entry.proc_fdtype == libc::PROX_FDTYPE_PIPE as u32)
+            .map(|entry| PipeHandle(pipe_info(entry.proc_fd).pipe_handle))
+            .collect()
+    }
+
+    fn pipe_info(fd: RawFd) -> PipeInfo {
+        let mut info = MaybeUninit::<PipeFdInfo>::uninit();
+        let info_size = mem::size_of::<PipeFdInfo>() as libc::c_int;
+        // SAFETY: proc_pidfdinfo writes at most info_size bytes to info.
+        let filled = unsafe {
+            libc::proc_pidfdinfo(
+                std::process::id() as libc::c_int,
+                fd,
+                PROC_PIDFDPIPEINFO,
+                info.as_mut_ptr().cast::<c_void>(),
+                info_size,
+            )
+        };
+        assert_eq!(filled, info_size, "proc_pidfdinfo reads pipe metadata");
+        // SAFETY: proc_pidfdinfo initialized the complete PipeFdInfo value.
+        unsafe { info.assume_init() }.pipe_info
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct PipeHandle(u64);
+
+    #[repr(C)]
+    struct ProcFileInfo {
+        open_flags: u32,
+        status: u32,
+        offset: libc::off_t,
+        file_type: i32,
+        guard_flags: u32,
+    }
+
+    #[repr(C)]
+    struct PipeInfo {
+        stat: libc::vinfo_stat,
+        pipe_handle: u64,
+        pipe_peerhandle: u64,
+        status: i32,
+        reserved: i32,
+    }
+
+    #[repr(C)]
+    struct PipeFdInfo {
+        file_info: ProcFileInfo,
+        pipe_info: PipeInfo,
+    }
+}
