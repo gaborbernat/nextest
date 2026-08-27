@@ -343,11 +343,8 @@ mod tests {
     const EOF_TIMEOUT: Duration = Duration::from_secs(30);
     const CHILD_LIFETIME: Duration = Duration::from_secs(120);
 
-    /// Spawns batches of children at the same time, each of which closes its
-    /// own capture pipes and then lingers. Every reader must reach EOF while
-    /// all the children are still alive: if a sibling inherited a pipe in the
-    /// window between `pipe()` and `FD_CLOEXEC`, it holds the writer open and
-    /// the read times out.
+    /// Children close their own capture pipes and linger, so a reader that
+    /// does not reach EOF proves a sibling inherited the writer.
     #[test_case(CaptureStrategy::Split; "split")]
     #[test_case(CaptureStrategy::Combined; "combined")]
     fn concurrent_spawns_do_not_inherit_capture_pipes(strategy: CaptureStrategy) {
@@ -384,9 +381,8 @@ mod tests {
         }
     }
 
-    /// Children that stay alive until killed. Killing them on drop keeps a
-    /// failed assertion from waiting out `CHILD_LIFETIME`: a leaked writer
-    /// blocks the capture read until its holder exits.
+    /// Kills on drop so a failed assertion does not wait out `CHILD_LIFETIME`
+    /// behind a leaked writer.
     struct LingeringChildren(Vec<TokioChild>);
 
     impl LingeringChildren {
@@ -446,20 +442,17 @@ mod tests {
         );
     }
 
-    /// The child half of `concurrent_spawns_do_not_inherit_capture_pipes`.
-    ///
-    /// This is not a test of its own: the parent selects it with `--exact
-    /// --ignored`. It closes its capture pipes so the parent can observe EOF,
-    /// then stays alive so that any sibling pipe it inherited stays open long
-    /// enough to be detected. The parent kills it once the round is checked;
-    /// the sleep bounds its lifetime if the parent dies first.
+    /// Not a test: the parent runs it with `--exact --ignored`. It closes its
+    /// capture pipes so the parent sees EOF, and lingers so an inherited
+    /// sibling pipe stays open long enough to detect; the sleep bounds it if
+    /// the parent dies first.
     #[test]
     #[ignore]
     fn child_closes_capture_and_lingers() {
         println!("{CAPTURE_MARKER}");
         io::stdout().flush().expect("stdout flushes");
-        // SAFETY: closing raw descriptors has no memory-safety preconditions,
-        // and nothing writes to stdout or stderr afterwards.
+        // SAFETY: `close` has no memory-safety preconditions, and nothing
+        // writes to these descriptors afterwards.
         unsafe {
             libc::close(libc::STDOUT_FILENO);
             libc::close(libc::STDERR_FILENO);

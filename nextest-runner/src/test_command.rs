@@ -27,21 +27,12 @@ mod imp;
 pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
 use imp::{pipe_reader_to_child_stderr, pipe_reader_to_child_stdout};
 
-/// Whether a concurrent spawn can inherit a freshly created capture pipe.
-///
-/// The standard library creates pipes with `pipe2(O_CLOEXEC)` on the targets
-/// listed below. On every other Unix it calls `pipe()` and then sets
-/// `FD_CLOEXEC`, so a child spawned from another thread in that window inherits
-/// the pipe and keeps it open after the test exits, which nextest reports as a
-/// leak (rust-lang/rust#95584). Windows has the same race, but the standard
-/// library already serializes `CreateProcess` there.
-///
-/// On these targets, [`create_pipe`] and [`spawn_process`] exclude each other
-/// through [`PROCESS_SPAWN_LOCK`]: pipe creation takes the write lock and
-/// spawning takes the read lock, so spawns still run concurrently with each
-/// other.
-///
-/// Keep the list in sync with `library/std/src/sys/pipe/unix.rs`.
+/// Outside the listed targets the standard library has no `pipe2(O_CLOEXEC)`
+/// and sets `FD_CLOEXEC` after `pipe()`, so a child spawned from another
+/// thread in that window keeps the capture writer open and the test shows up
+/// as leaked (rust-lang/rust#95584). Windows serializes `CreateProcess` inside
+/// the standard library. Keep the list in sync with
+/// `library/std/src/sys/pipe/unix.rs`.
 const SPAWN_INHERITS_PIPES: bool = cfg!(all(
     unix,
     not(any(
@@ -58,6 +49,8 @@ const SPAWN_INHERITS_PIPES: bool = cfg!(all(
     ))
 ));
 
+/// Write side for pipe creation, read side for spawning: spawns must exclude
+/// pipe creation, not each other.
 static PROCESS_SPAWN_LOCK: RwLock<()> = RwLock::new(());
 
 #[derive(Clone, Debug)]
@@ -245,15 +238,11 @@ impl TestCommand {
     }
 }
 
-/// Creates a pipe that no concurrent [`spawn_process`] call can inherit.
-///
-/// This uses `std::io::pipe()` rather than `tokio::net::unix::pipe()` because
-/// the standard library has the most up-to-date knowledge of atomic
-/// `O_CLOEXEC` support (mio-pipe 0.1.1 does not set it on illumos, for
-/// example), and because Tokio has no anonymous pipes on Windows.
+/// `std::io::pipe()` rather than Tokio's pipes: the standard library tracks
+/// atomic `O_CLOEXEC` per target (mio-pipe 0.1.1 lacks it on illumos), and
+/// Tokio has no anonymous pipes on Windows.
 pub(crate) fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
-    // The lock guards no data, so a panic while holding it leaves nothing in
-    // an inconsistent state and poisoning can be ignored.
+    // The lock guards no data, so poisoning carries no invariant.
     let _guard = SPAWN_INHERITS_PIPES.then(|| {
         PROCESS_SPAWN_LOCK
             .write()
@@ -262,24 +251,16 @@ pub(crate) fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
     std::io::pipe()
 }
 
-/// Runs `spawn` while no [`create_pipe`] call is in progress.
+/// Callers must not use `Stdio::piped()`: the standard library would create
+/// those pipes inside its spawn, outside the write lock.
 ///
-/// Capture pipes must come from [`create_pipe`] rather than `Stdio::piped()`,
-/// which would create them inside the standard library's spawn without the
-/// write lock.
-///
-/// The standard library creates one more pipe of its own when it falls back
-/// from `posix_spawn` to fork and exec, and that pipe is not covered here.
-/// Nextest does not reach that path in the default configuration:
-/// [`create_command`] spawns the current executable through the double-spawn
-/// stub, so the program the standard library sees is absolute, and the stub
-/// execs the wrapper without a further spawn. Interceptors skip double-spawn
-/// but create processes serially, so no other spawn can overlap. The fallback
-/// remains reachable when the current executable cannot be determined and a
-/// wrapper script uses a relative path without `relative-to`, or a bare name
-/// while `PATH` is set through `[env]` or a setup script. Even then the effect
-/// is a spawn that blocks until the inheriting child exits; the capture pipes
-/// stay unaffected.
+/// The standard library's fork-and-exec fallback creates one more pipe that
+/// this lock does not cover. Nextest does not reach it by default:
+/// [`create_command`] spawns the absolute current executable, so `posix_spawn`
+/// applies, and interceptors spawn one process at a time. It stays reachable
+/// without double-spawn and with a relative or bare wrapper program; the cost
+/// is a spawn that blocks until the inheriting child exits, and the capture
+/// pipes stay untouched.
 pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     let _guard = SPAWN_INHERITS_PIPES.then(|| {
         PROCESS_SPAWN_LOCK
@@ -289,8 +270,6 @@ pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> st
     spawn()
 }
 
-/// Spawns `cmd`, capturing the requested streams through pipes from
-/// [`create_pipe`] and attaching the reader ends to the returned child.
 pub(crate) fn spawn_piped(
     mut cmd: std::process::Command,
     capture_stdout: bool,
