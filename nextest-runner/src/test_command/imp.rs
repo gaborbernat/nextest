@@ -454,10 +454,9 @@ mod tests {
         );
     }
 
-    /// Not a test: the parent runs it with `--exact --ignored`. It closes its
-    /// capture pipes so the parent sees EOF, and lingers so an inherited
-    /// sibling pipe stays open long enough to detect; the sleep bounds it if
-    /// the parent dies first.
+    /// Not a test: the parent runs it with `--exact --ignored`. Closes its
+    /// capture pipes so the parent sees EOF, lingers so an inherited pipe
+    /// stays detectable, and the sleep bounds it if the parent dies first.
     #[test]
     #[ignore]
     fn child_closes_capture_and_lingers() {

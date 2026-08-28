@@ -50,8 +50,7 @@ const SPAWN_INHERITS_PIPES: bool = cfg!(all(
     ))
 ));
 
-/// Write side for pipe creation, read side for spawning: spawns must exclude
-/// pipe creation, not each other.
+/// Spawns must exclude pipe creation, not each other.
 static PROCESS_SPAWN_LOCK: RwLock<()> = RwLock::new(());
 
 #[derive(Clone, Debug)]
@@ -255,12 +254,11 @@ fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
 /// Callers must not use `Stdio::piped()`: the standard library would create
 /// those pipes inside its spawn, outside the write lock.
 ///
-/// The read lock is enough only where `posix_spawn` is guaranteed: on Apple
-/// with an absolute program. Anywhere else the standard library may fall back
-/// to fork and exec, which creates an exec-error pipe of its own inside the
-/// spawn; leaking that pipe into a concurrent child would block this spawn,
-/// and with it every `create_pipe` call, until that child exits. Those spawns
-/// take the write lock so no child can inherit the pipe.
+/// The read lock is enough only where `posix_spawn` is guaranteed, on Apple
+/// with an absolute program. Elsewhere a fork-and-exec fallback creates an
+/// exec-error pipe inside the spawn; leaked into a concurrent child it would
+/// stall this spawn and every `create_pipe` behind it, so those spawns take
+/// the write lock.
 fn spawn_process(cmd: std::process::Command) -> std::io::Result<tokio::process::Child> {
     let exclusive = SPAWN_INHERITS_PIPES
         && (!cfg!(target_vendor = "apple") || !Path::new(cmd.get_program()).is_absolute());
@@ -299,8 +297,7 @@ pub(crate) fn spawn_piped(
 
     let mut child = spawn_process(cmd)?;
     if let Err(error) = attach_capture_readers(&mut child, stdout_rx, stderr_rx) {
-        // The child has no supervisor yet, so an unkilled child would run to
-        // completion unobserved.
+        // No supervisor exists yet; an unkilled child would run unobserved.
         _ = child.start_kill();
         return Err(error);
     }
