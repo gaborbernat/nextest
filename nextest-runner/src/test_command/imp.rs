@@ -7,7 +7,11 @@ use crate::{
     test_output::{CaptureStrategy, ChildExecutionOutput, ChildOutput, ChildSplitOutput},
 };
 use bytes::BytesMut;
-use std::{io, process::Stdio, sync::Arc};
+use std::{
+    io::{self, PipeReader},
+    process::Stdio,
+    sync::Arc,
+};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, BufReader},
@@ -28,7 +32,15 @@ cfg_if::cfg_if! {
     }
 }
 
-pub(super) use os::{pipe_reader_to_child_stderr, pipe_reader_to_child_stdout};
+pub(super) fn attach_capture_readers(
+    child: &mut TokioChild,
+    stdout_rx: Option<PipeReader>,
+    stderr_rx: Option<PipeReader>,
+) -> io::Result<()> {
+    child.stdout = stdout_rx.map(os::pipe_reader_to_child_stdout).transpose()?;
+    child.stderr = stderr_rx.map(os::pipe_reader_to_child_stderr).transpose()?;
+    Ok(())
+}
 
 /// A spawned child process along with its file descriptors.
 pub(crate) struct Child {
@@ -49,7 +61,7 @@ pub(super) fn spawn(
 
     let (child, child_fds) = match strategy {
         CaptureStrategy::None => {
-            let child = spawn_process(|| tokio::process::Command::from(cmd).spawn())?;
+            let child = spawn_process(cmd)?;
             (child, ChildFds::new_split(None, None))
         }
         CaptureStrategy::Split => {
@@ -61,7 +73,7 @@ pub(super) fn spawn(
         CaptureStrategy::Combined => {
             let (rx, tx) = create_pipe()?;
             cmd.stdout(tx.try_clone()?).stderr(tx);
-            let child = spawn_process(|| tokio::process::Command::from(cmd).spawn())?;
+            let child = spawn_process(cmd)?;
             let combined = os::pipe_reader_to_file(rx).into();
             (child, ChildFds::new_combined(combined))
         }

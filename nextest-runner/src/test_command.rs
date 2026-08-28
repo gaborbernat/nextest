@@ -19,13 +19,14 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{BufRead, BufReader, PipeReader, PipeWriter},
+    path::Path,
     sync::{LazyLock, PoisonError, RwLock},
 };
 use tracing::warn;
 
 mod imp;
+use imp::attach_capture_readers;
 pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
-use imp::{pipe_reader_to_child_stderr, pipe_reader_to_child_stdout};
 
 /// Outside the listed targets the standard library has no `pipe2(O_CLOEXEC)`
 /// and sets `FD_CLOEXEC` after `pipe()`, so a child spawned from another
@@ -241,7 +242,7 @@ impl TestCommand {
 /// `std::io::pipe()` rather than Tokio's pipes: the standard library tracks
 /// atomic `O_CLOEXEC` per target (mio-pipe 0.1.1 lacks it on illumos), and
 /// Tokio has no anonymous pipes on Windows.
-pub(crate) fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
+fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
     // The lock guards no data, so poisoning carries no invariant.
     let _guard = SPAWN_INHERITS_PIPES.then(|| {
         PROCESS_SPAWN_LOCK
@@ -254,20 +255,26 @@ pub(crate) fn create_pipe() -> std::io::Result<(PipeReader, PipeWriter)> {
 /// Callers must not use `Stdio::piped()`: the standard library would create
 /// those pipes inside its spawn, outside the write lock.
 ///
-/// The standard library's fork-and-exec fallback creates one more pipe that
-/// this lock does not cover. Nextest does not reach it by default:
-/// [`create_command`] spawns the absolute current executable, so `posix_spawn`
-/// applies, and interceptors spawn one process at a time. It stays reachable
-/// without double-spawn and with a relative or bare wrapper program; the cost
-/// is a spawn that blocks until the inheriting child exits, and the capture
-/// pipes stay untouched.
-pub(crate) fn spawn_process<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    let _guard = SPAWN_INHERITS_PIPES.then(|| {
+/// The read lock is enough only where `posix_spawn` is guaranteed: on Apple
+/// with an absolute program. Anywhere else the standard library may fall back
+/// to fork and exec, which creates an exec-error pipe of its own inside the
+/// spawn; leaking that pipe into a concurrent child would block this spawn,
+/// and with it every `create_pipe` call, until that child exits. Those spawns
+/// take the write lock so no child can inherit the pipe.
+fn spawn_process(cmd: std::process::Command) -> std::io::Result<tokio::process::Child> {
+    let exclusive = SPAWN_INHERITS_PIPES
+        && (!cfg!(target_vendor = "apple") || !Path::new(cmd.get_program()).is_absolute());
+    let _write_guard = exclusive.then(|| {
+        PROCESS_SPAWN_LOCK
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    });
+    let _read_guard = (SPAWN_INHERITS_PIPES && !exclusive).then(|| {
         PROCESS_SPAWN_LOCK
             .read()
             .unwrap_or_else(PoisonError::into_inner)
     });
-    spawn()
+    tokio::process::Command::from(cmd).spawn()
 }
 
 pub(crate) fn spawn_piped(
@@ -290,9 +297,13 @@ pub(crate) fn spawn_piped(
         None
     };
 
-    let mut child = spawn_process(|| tokio::process::Command::from(cmd).spawn())?;
-    child.stdout = stdout_rx.map(pipe_reader_to_child_stdout).transpose()?;
-    child.stderr = stderr_rx.map(pipe_reader_to_child_stderr).transpose()?;
+    let mut child = spawn_process(cmd)?;
+    if let Err(error) = attach_capture_readers(&mut child, stdout_rx, stderr_rx) {
+        // The child has no supervisor yet, so an unkilled child would run to
+        // completion unobserved.
+        _ = child.start_kill();
+        return Err(error);
+    }
     Ok(child)
 }
 
