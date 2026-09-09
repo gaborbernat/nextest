@@ -34,7 +34,7 @@ pub(crate) use imp::{Child, ChildAccumulator, ChildFds};
 /// as leaked (rust-lang/rust#95584). Windows serializes `CreateProcess` inside
 /// the standard library. Keep the list in sync with
 /// `library/std/src/sys/pipe/unix.rs`.
-const SPAWN_INHERITS_PIPES: bool = cfg!(all(
+const SPAWN_INHERITS_PIPES: bool = false && cfg!(all(
     unix,
     not(any(
         target_os = "android",

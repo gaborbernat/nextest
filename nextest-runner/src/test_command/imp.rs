@@ -350,9 +350,9 @@ mod tests {
     use test_case::test_case;
 
     const SPAWN_CONCURRENCY: usize = 32;
-    const SPAWN_ROUNDS: usize = 16;
+    const SPAWN_ROUNDS: usize = 32;
     const CAPTURE_MARKER: &str = "NEXTEST_CAPTURE_CLOSED";
-    const EOF_TIMEOUT: Duration = Duration::from_secs(30);
+    const EOF_TIMEOUT: Duration = Duration::from_secs(5);
     const CHILD_LIFETIME: Duration = Duration::from_secs(120);
 
     /// Children close their own capture pipes and linger, so a reader that
